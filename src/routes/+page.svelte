@@ -1,143 +1,249 @@
 <script lang="ts">
-	import {
-		createLocalRuntime,
-		runLocalTurn,
-		type JudgmentRoute,
-		type LocalRuntimeState
-	} from '$lib';
+	import { onMount, onDestroy, untrack } from 'svelte';
+	import type { PageData } from './$types';
+	import type { JudgmentRoute } from '$lib/agent/contracts';
 
-	type ThreadMessage = {
-		id: string;
-		speaker: 'you' | 'mistawhite';
-		text: string;
-		meta?: string;
-		audioUrl?: string;
-	};
-
-	const userId = 'local-prototype-user';
-	let runtime: LocalRuntimeState = $state(createLocalRuntime(userId));
+	let { data }: { data: PageData } = $props();
+	type Message = { id: string; speaker: 'you' | 'mistawhite'; text: string; meta?: string };
+	type AudioItem = { id: string; duration: number; url: string };
+	let runtime = $state(untrack(() => data.runtime));
+	let revision = $state(untrack(() => data.revision));
 	let draft = $state('');
-	let isRecording = $state(false);
-	let recordingStartedAt = $state<number | null>(null);
-	let recorder: MediaRecorder | null = null;
-	let recordingStream: MediaStream | null = null;
-	let audioChunks: Blob[] = [];
+	let busy = $state(false);
+	let notice = $state('');
+	let pending: {
+		id: string;
+		content: string;
+		occurredAt: string;
+		expectedRevision: number;
+	} | null = $state(null);
 	let lastRoute: JudgmentRoute = $state('deterministic');
-	let messages: ThreadMessage[] = $state([
-		{
-			id: 'opening',
-			speaker: 'mistawhite',
-			text: 'Start anywhere. Tell me what happened, not what it proves about you.',
-			meta: 'FIELD NOTE 00'
-		}
-	]);
-
+	function thread(turns: PageData['turns']): Message[] {
+		return turns.flatMap((turn) => [
+			{ id: turn.id, speaker: 'you' as const, text: turn.input.content, meta: 'SAVED NOTE' },
+			{
+				id: turn.id + ':reply',
+				speaker: 'mistawhite' as const,
+				text: turn.response.text,
+				meta: 'MISTAWHITE'
+			}
+		]);
+	}
+	let messages = $state<Message[]>(untrack(() => thread(data.turns)));
+	$effect(() => {
+		runtime = data.runtime;
+		revision = data.revision;
+		messages = thread(data.turns);
+	});
 	const stanceLabel = $derived(runtime.character.stance.replaceAll('-', ' '));
 	const irritation = $derived(
 		Math.round(Math.max(...Object.values(runtime.character.irritation)) * 100)
 	);
 	const curiosity = $derived(Math.round(runtime.character.curiosity * 100));
+	let recordings = $state<AudioItem[]>([]);
+	let localAudio = $state<{ id: string; blob: Blob; url: string; duration: number } | null>(null);
+	let audioBusy = $state(false);
+	let audioNotice = $state('');
+	let isRecording = $state(false);
+	let acquiring = $state(false);
+	let recorder: MediaRecorder | null = null;
+	let stream: MediaStream | null = null;
+	let started = 0;
+	let chunks: Blob[] = [];
+	let stopTimer: ReturnType<typeof setTimeout> | undefined;
+	let disposed = false;
+	const localUrls = new Set<string>();
 
-	function submitText() {
-		const content = draft.trim();
-		if (!content) return;
-
-		const id = crypto.randomUUID();
-		const result = runLocalTurn(runtime, {
-			id,
-			userId,
-			channel: 'text',
-			content,
-			occurredAt: new Date().toISOString(),
-			sourceId: `browser:${id}`
-		});
-
-		messages.push(
-			{ id, speaker: 'you', text: content, meta: 'RAW OBSERVATION' },
-			{
-				id: crypto.randomUUID(),
-				speaker: 'mistawhite',
-				text: result.displayText,
-				meta: result.judgmentRoute.toUpperCase().replace('-', ' ')
-			}
+	async function request<T>(url: string, payload?: unknown): Promise<T> {
+		const response = await fetch(
+			url,
+			payload === undefined
+				? {}
+				: {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify(payload)
+					}
 		);
-		runtime = { kernel: result.kernelState, character: result.characterState };
-		lastRoute = result.judgmentRoute;
-		draft = '';
+		const body = await response.json();
+		if (!response.ok) throw new Error(body.message ?? 'Request failed. Please retry.');
+		return body;
 	}
-
-	function handleComposerKeydown(event: KeyboardEvent) {
-		if (event.key === 'Enter' && !event.shiftKey) {
-			event.preventDefault();
-			submitText();
+	async function refreshNotebook() {
+		if (!data.configured || busy) return;
+		busy = true;
+		try {
+			const saved = await request<{
+				runtime: typeof runtime;
+				revision: number;
+				turns: PageData['turns'];
+			}>('/api/turns');
+			runtime = saved.runtime;
+			revision = saved.revision;
+			messages = thread(saved.turns);
+			if (pending) pending.expectedRevision = revision;
+			notice = 'Notebook refreshed. Your draft has been kept.';
+		} catch (error) {
+			notice = error instanceof Error ? error.message : 'Could not refresh.';
+		} finally {
+			busy = false;
 		}
 	}
-
+	async function submitText() {
+		if (!data.configured || busy || (!draft.trim() && !pending)) return;
+		busy = true;
+		notice = 'Saving…';
+		pending ??= {
+			id: crypto.randomUUID(),
+			content: draft.trim(),
+			occurredAt: new Date().toISOString(),
+			expectedRevision: revision
+		};
+		try {
+			const saved = await request<{
+				runtime: typeof runtime;
+				revision: number;
+				turns: PageData['turns'];
+			}>('/api/turns', pending);
+			runtime = saved.runtime;
+			revision = saved.revision;
+			messages = thread(saved.turns);
+			lastRoute = saved.turns.at(-1)?.response.route ?? 'deterministic';
+			draft = '';
+			pending = null;
+			notice = 'Saved to your account.';
+		} catch (error) {
+			notice = error instanceof Error ? error.message : 'Save not confirmed. Retry this note.';
+		} finally {
+			busy = false;
+		}
+	}
+	function handleComposerKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+			event.preventDefault();
+			void submitText();
+		}
+	}
+	async function refreshAudio() {
+		try {
+			recordings = await request<AudioItem[]>('/api/audio');
+		} catch (error) {
+			audioNotice = error instanceof Error ? error.message : 'Could not load recordings.';
+		}
+	}
+	onMount(() => {
+		if (data.configured) void refreshAudio();
+	});
+	onDestroy(() => {
+		disposed = true;
+		clearTimeout(stopTimer);
+		if (recorder?.state === 'recording') recorder.stop();
+		stream?.getTracks().forEach((track) => track.stop());
+		localUrls.forEach((url) => URL.revokeObjectURL(url));
+	});
 	async function toggleRecording() {
 		if (isRecording && recorder) {
 			recorder.stop();
 			return;
 		}
-
+		if (!data.configured || acquiring || localAudio) return;
 		if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-			messages.push({
-				id: crypto.randomUUID(),
-				speaker: 'mistawhite',
-				text: 'This browser cannot record audio. Use text here; the evidence is no less real.',
-				meta: 'DEVICE LIMIT'
-			});
+			audioNotice = 'Recording is unavailable in this browser. You can still write a note.';
 			return;
 		}
-
+		acquiring = true;
 		try {
-			recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-			audioChunks = [];
-			recorder = new MediaRecorder(recordingStream);
-			recorder.addEventListener('dataavailable', (event) => {
-				if (event.data.size) audioChunks.push(event.data);
-			});
-			recorder.addEventListener('stop', saveRecording, { once: true });
-			recorder.start();
-			recordingStartedAt = Date.now();
+			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+			if (disposed) {
+				stream.getTracks().forEach((track) => track.stop());
+				return;
+			}
+			chunks = [];
+			recorder = new MediaRecorder(stream);
+			recorder.ondataavailable = (event) => {
+				if (event.data.size) chunks.push(event.data);
+				if (
+					chunks.reduce((sum, chunk) => sum + chunk.size, 0) > 25 * 1024 * 1024 &&
+					recorder?.state === 'recording'
+				)
+					recorder.stop();
+			};
+			recorder.onstop = () => {
+				clearTimeout(stopTimer);
+				const mime = recorder?.mimeType || 'audio/webm';
+				stream?.getTracks().forEach((track) => track.stop());
+				isRecording = false;
+				stream = null;
+				recorder = null;
+				if (disposed) return;
+				const blob = new Blob(chunks, { type: mime });
+				const url = URL.createObjectURL(blob);
+				localUrls.add(url);
+				localAudio = {
+					id: crypto.randomUUID(),
+					blob,
+					url,
+					duration: Math.min(300, Math.round((Date.now() - started) / 1000))
+				};
+				audioNotice = 'Recorded on this device. Save privately to keep it after closing the page.';
+			};
+			recorder.start(1000);
+			started = Date.now();
 			isRecording = true;
+			stopTimer = setTimeout(() => {
+				if (recorder?.state === 'recording') recorder.stop();
+			}, 299000);
 		} catch {
-			messages.push({
-				id: crypto.randomUUID(),
-				speaker: 'mistawhite',
-				text: 'The microphone stayed closed. I will not pretend I heard you.',
-				meta: 'PERMISSION REQUIRED'
-			});
+			stream?.getTracks().forEach((track) => track.stop());
+			audioNotice = 'Microphone unavailable. Check permission and try again.';
+		} finally {
+			acquiring = false;
 		}
 	}
-
-	function saveRecording() {
-		const duration = recordingStartedAt
-			? Math.max(1, Math.round((Date.now() - recordingStartedAt) / 1000))
-			: 0;
-		const type = recorder?.mimeType || 'audio/webm';
-		const blob = new Blob(audioChunks, { type });
-		const audioUrl = URL.createObjectURL(blob);
-
-		messages.push(
-			{
-				id: crypto.randomUUID(),
-				speaker: 'you',
-				text: `${duration}s field recording`,
-				meta: 'LOCAL AUDIO · UNTRANSCRIBED',
-				audioUrl
-			},
-			{
-				id: crypto.randomUUID(),
-				speaker: 'mistawhite',
-				text: 'Captured locally. The original stays separate from anything I infer. Transcription joins when the private storage adapter does.',
-				meta: 'PROVENANCE KEPT'
+	async function uploadAudio() {
+		if (!localAudio || audioBusy) return;
+		audioBusy = true;
+		audioNotice = 'Saving your recording…';
+		const item = localAudio;
+		try {
+			const prepared = await request<{ alreadyUploaded: boolean; signedUrl: string | null }>(
+				'/api/audio',
+				{
+					id: item.id,
+					mime: item.blob.type.split(';')[0],
+					size: item.blob.size,
+					duration: item.duration
+				}
+			);
+			if (!prepared.alreadyUploaded && prepared.signedUrl) {
+				const result = await fetch(prepared.signedUrl, {
+					method: 'PUT',
+					headers: { 'Content-Type': item.blob.type.split(';')[0] },
+					body: item.blob
+				});
+				if (!result.ok)
+					throw new Error('Upload was not confirmed. Your recording is still here; retry saving.');
 			}
-		);
-		recordingStream?.getTracks().forEach((track) => track.stop());
-		recordingStream = null;
-		recorder = null;
-		isRecording = false;
-		recordingStartedAt = null;
+			await request('/api/audio?action=complete', { id: item.id });
+			URL.revokeObjectURL(item.url);
+			localUrls.delete(item.url);
+			localAudio = null;
+			await refreshAudio();
+			audioNotice = 'Saved privately. Not transcribed or analysed yet.';
+		} catch (error) {
+			audioNotice =
+				error instanceof Error ? error.message : 'Could not save. Retry this recording.';
+		} finally {
+			audioBusy = false;
+		}
+	}
+	function discardLocalAudio() {
+		if (!localAudio || audioBusy) return;
+		if (!confirm('Discard this unsaved recording from this device?')) return;
+		URL.revokeObjectURL(localAudio.url);
+		localUrls.delete(localAudio.url);
+		localAudio = null;
+		audioNotice = 'Unsaved recording discarded from this device.';
 	}
 </script>
 
@@ -154,8 +260,20 @@
 				<h1>MistaWhite</h1>
 			</div>
 		</div>
-		<div class="presence"><i></i><span>{stanceLabel}</span></div>
+		<div class="presence"><span>{stanceLabel}</span></div>
 	</header>
+	<div class="account-bar">
+		{#if data.configured}
+			<span>{data.email}</span>
+			<button type="button" onclick={refreshNotebook} disabled={busy}>Refresh notebook</button>
+			<form method="POST" action="/logout"><button>Sign out</button></form>
+		{:else}
+			<p>
+				Preview only. Account storage must be connected before notes or recordings can be saved.
+			</p>
+			<a href="/login">Account setup status</a>
+		{/if}
+	</div>
 
 	<section class="workspace">
 		<aside class="character-panel">
@@ -201,6 +319,9 @@
 			</div>
 
 			<div class="thread" aria-live="polite">
+				{#if messages.length === 0}<p>
+						Start anywhere. Tell me what happened, not what it proves about you.
+					</p>{/if}
 				{#each messages as message (message.id)}
 					<article class:from-user={message.speaker === 'you'} class="message">
 						<header>
@@ -209,9 +330,6 @@
 							>
 						</header>
 						<p>{message.text}</p>
-						{#if message.audioUrl}
-							<audio controls src={message.audioUrl}><track kind="captions" /></audio>
-						{/if}
 					</article>
 				{/each}
 			</div>
@@ -222,6 +340,8 @@
 					<textarea
 						id="field-note"
 						bind:value={draft}
+						disabled={!data.configured || busy || pending !== null}
+						maxlength="12000"
 						onkeydown={handleComposerKeydown}
 						rows="2"
 						placeholder="What happened? What did you notice?"></textarea>
@@ -230,27 +350,93 @@
 						class="record"
 						type="button"
 						onclick={toggleRecording}
+						disabled={!data.configured || acquiring || localAudio !== null}
 						aria-label={isRecording ? 'Stop recording' : 'Start voice recording'}><i></i></button
 					>
 					<button
 						class="send"
 						type="button"
 						onclick={submitText}
-						disabled={!draft.trim()}
+						disabled={!data.configured || busy || (!draft.trim() && !pending)}
 						aria-label="Send observation">↗</button
 					>
 				</div>
 				<p class="composer-note">
 					{isRecording
 						? 'Recording — press the red control to stop'
-						: 'Enter to send · Shift + Enter for a new line · voice stays local in this prototype'}
+						: 'Enter to send · Shift + Enter for a new line'}
 				</p>
+				<p role="status" class="save-status">{notice}</p>
+				{#if pending && !busy}<button class="utility" onclick={submitText}
+						>Retry saving this note</button
+					>{/if}
 			</div>
+			<section class="audio-library" aria-label="Your recordings">
+				<h3>Field recordings</h3>
+				<p>Saved audio is private. Transcription and analysis are not connected yet.</p>
+				{#if localAudio}
+					<p>{localAudio.duration}s · not saved yet</p>
+					<audio controls src={localAudio.url}><track kind="captions" /></audio>
+					<button class="utility" onclick={uploadAudio} disabled={audioBusy}>Save privately</button>
+					<button class="utility" onclick={discardLocalAudio} disabled={audioBusy}
+						>Discard local recording</button
+					>
+				{/if}
+				<p role="status">{audioNotice}</p>
+				{#if data.configured}<button class="utility" onclick={refreshAudio}
+						>Refresh recordings and playback links</button
+					>{/if}
+				{#each recordings as recording (recording.id)}
+					<p>{recording.duration}s · saved, untranscribed</p>
+					<audio controls src={recording.url}><track kind="captions" /></audio>
+				{/each}
+			</section>
 		</section>
 	</section>
 </main>
 
 <style>
+	.account-bar {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 16px;
+		padding: 16px 0;
+		font-size: 14px;
+	}
+	.account-bar p {
+		margin: 0;
+	}
+	.account-bar button,
+	.utility {
+		color: var(--paper);
+		background: var(--panel);
+		border: 1px solid var(--line);
+		padding: 10px;
+		cursor: pointer;
+		font-size: 14px;
+	}
+	.account-bar a {
+		color: var(--amber);
+	}
+	.audio-library {
+		margin-top: 24px;
+		padding: 16px 0;
+		border-top: 1px solid var(--line);
+	}
+	.audio-library p {
+		font-size: 14px;
+		color: var(--muted);
+		line-height: 1.6;
+	}
+	.save-status {
+		font-size: 14px;
+		line-height: 1.5;
+	}
+	button:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
 	.shell {
 		width: min(1280px, 100%);
 		min-height: 100vh;
@@ -308,13 +494,6 @@
 		font: 400 10px 'DM Mono';
 		letter-spacing: 0.12em;
 		text-transform: uppercase;
-	}
-	.presence i {
-		width: 6px;
-		height: 6px;
-		border-radius: 50%;
-		background: var(--amber);
-		box-shadow: 0 0 12px var(--amber);
 	}
 	.workspace {
 		min-height: calc(100vh - 120px);

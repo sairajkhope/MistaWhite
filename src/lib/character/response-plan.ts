@@ -27,7 +27,9 @@ export function planCharacterResponse(
 			privateMotive: 'Protect the person before protecting the experiment.',
 			objectives: ['Name the concern plainly', 'Recommend the safest immediate next step'],
 			constraints: [...MISTA_WHITE.invariants, 'Use no humour'],
-			maximumQuestions: 1
+			maximumQuestions: 1,
+			suggestedOpening:
+				'I want to take that seriously. Are you in immediate danger right now? If you might act on this, contact local emergency services or someone nearby who can stay with you. This app cannot provide emergency support.'
 		};
 	}
 

@@ -34,3 +34,11 @@ npm run build
 
 - [System architecture](docs/architecture.md)
 - [Character bible](docs/character-bible.md)
+- [Supabase activation and acceptance checks](docs/setup.md)
+
+## Continuity pass
+
+Email-code authentication, server-side text processing, atomic account ledger/snapshots,
+retry-safe saves, and private audio uploads are now implemented. Configure Supabase
+using the setup guide to activate them; without configuration the UI is a disabled preview.
+No live Auth/Storage acceptance testing or deployment has been performed yet.
